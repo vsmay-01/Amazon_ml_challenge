@@ -15,6 +15,9 @@ whether a blocking pass earns its place in the final union.
 """
 from __future__ import annotations
 
+import math
+import sqlite3
+from collections import Counter
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Iterable
@@ -33,6 +36,217 @@ class BlockingResult:
     # candidate[q_id] = set of (source_name, candidate_id)
     candidates: dict[str, set[tuple[str, str]]]
     per_pass_candidates: dict[str, dict[str, set[tuple[str, str]]]]
+
+
+class DiskTargetIndex:
+    """SQLite-backed blocking index built in a single streaming target pass."""
+
+    def __init__(self, path: str):
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self.connection.executescript(
+            """
+            CREATE TABLE records (
+                entity_id TEXT PRIMARY KEY,
+                business_name TEXT NOT NULL,
+                business_address TEXT NOT NULL,
+                country TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                tfidf_norm REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE postings (
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                PRIMARY KEY (kind, key, entity_id)
+            );
+            CREATE INDEX postings_lookup ON postings(kind, key);
+            CREATE TABLE tfidf_terms (
+                entity_id TEXT NOT NULL,
+                term TEXT NOT NULL,
+                tf INTEGER NOT NULL,
+                PRIMARY KEY (entity_id, term)
+            );
+            CREATE INDEX tfidf_term_lookup ON tfidf_terms(term, entity_id);
+            CREATE TABLE term_df (
+                term TEXT PRIMARY KEY,
+                doc_freq INTEGER NOT NULL,
+                idf REAL NOT NULL DEFAULT 0
+            );
+            CREATE TEMP TABLE query_keys (key TEXT PRIMARY KEY);
+            CREATE TEMP TABLE query_terms (
+                term TEXT PRIMARY KEY,
+                tf INTEGER NOT NULL,
+                idf REAL NOT NULL
+            );
+            CREATE TEMP TABLE query_ids (entity_id TEXT PRIMARY KEY);
+            """
+        )
+        self._analyzer = TfidfVectorizer(
+            analyzer="char_wb", ngram_range=(2, 4)
+        ).build_analyzer()
+        self._document_count = 0
+        self._nonempty_document_count = 0
+
+    def add_batch(self, target: pd.DataFrame) -> None:
+        records = []
+        postings = []
+        tfidf_rows = []
+        document_frequencies = Counter()
+
+        for row in target.itertuples(index=False):
+            entity_id = str(row.entity_id)
+            name = str(row.business_name)
+            address = str(row.business_address)
+            country = str(row.country)
+            ordinal = self._document_count + len(records)
+            normalized_name = normalize_name(name)
+            normalized_address = normalize_address(address)
+            records.append((entity_id, name, address, country, ordinal))
+
+            indexed_keys = (
+                ("exact_name", [normalized_name.no_suffix]),
+                ("name_token", [t for t in normalized_name.no_suffix.split() if len(t) >= 2]),
+                ("name_char_ngram", normalized_name.char_ngrams),
+                ("address_token", [t for t in normalized_address.tokens if len(t) >= 3]),
+                ("address_char", normalized_address.char_ngrams),
+            )
+            for kind, keys in indexed_keys:
+                postings.extend((kind, key, entity_id) for key in set(keys) if key)
+
+            document = normalized_name.no_suffix + " " + normalized_address.norm
+            term_counts = Counter(self._analyzer(document))
+            self._nonempty_document_count += bool(term_counts)
+            tfidf_rows.extend((entity_id, term, count) for term, count in term_counts.items())
+            document_frequencies.update(term_counts.keys())
+
+        try:
+            with self.connection:
+                self.connection.executemany(
+                    "INSERT INTO records(entity_id, business_name, business_address, country, ordinal) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    records,
+                )
+                self.connection.executemany(
+                    "INSERT INTO postings(kind, key, entity_id) VALUES (?, ?, ?)", postings
+                )
+                self.connection.executemany(
+                    "INSERT INTO tfidf_terms(entity_id, term, tf) VALUES (?, ?, ?)", tfidf_rows
+                )
+                self.connection.executemany(
+                    "INSERT INTO term_df(term, doc_freq) VALUES (?, ?) "
+                    "ON CONFLICT(term) DO UPDATE SET doc_freq = doc_freq + excluded.doc_freq",
+                    document_frequencies.items(),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("Target source contains duplicate entity_id values") from error
+        self._document_count += len(records)
+
+    def finalize(self) -> None:
+        if not self._document_count:
+            return
+        self.connection.execute(
+            "CREATE TEMP TABLE term_df_snapshot AS SELECT term, doc_freq FROM term_df"
+        )
+        cursor = self.connection.execute("SELECT term, doc_freq FROM term_df_snapshot")
+        while terms := cursor.fetchmany(10000):
+            with self.connection:
+                self.connection.executemany(
+                    "UPDATE term_df SET idf = ? WHERE term = ?",
+                    (
+                        (math.log((1 + self._document_count) / (1 + doc_freq)) + 1, term)
+                        for term, doc_freq in terms
+                    ),
+                )
+        self.connection.execute("DROP TABLE term_df_snapshot")
+        self.connection.execute(
+            "UPDATE records SET tfidf_norm = COALESCE(("
+            "SELECT sqrt(SUM(tfidf_terms.tf * term_df.idf * tfidf_terms.tf * term_df.idf)) "
+            "FROM tfidf_terms JOIN term_df USING(term) "
+            "WHERE tfidf_terms.entity_id = records.entity_id), 0)"
+        )
+        self.connection.commit()
+
+    def _lookup(self, kind: str, keys: Iterable[str], minimum_shared: int = 1) -> set[str]:
+        unique_keys = {key for key in keys if key}
+        if not unique_keys:
+            return set()
+        self.connection.execute("DELETE FROM query_keys")
+        self.connection.executemany(
+            "INSERT INTO query_keys(key) VALUES (?)", ((key,) for key in unique_keys)
+        )
+        rows = self.connection.execute(
+            "SELECT postings.entity_id FROM postings "
+            "JOIN query_keys ON postings.key = query_keys.key "
+            "WHERE postings.kind = ? GROUP BY postings.entity_id "
+            "HAVING COUNT(*) >= ?",
+            (kind, minimum_shared),
+        )
+        return {row[0] for row in rows}
+
+    def _tfidf_candidates(self, name: str, address: str, top_k: int = 20) -> set[str]:
+        if not self._nonempty_document_count:
+            return set()
+        document = normalize_name(name).no_suffix + " " + normalize_address(address).norm
+        term_counts = Counter(self._analyzer(document))
+        self.connection.execute("DELETE FROM query_terms")
+        self.connection.executemany(
+            "INSERT INTO query_terms(term, tf, idf) "
+            "SELECT ?, ?, idf FROM term_df WHERE term = ?",
+            ((term, tf, term) for term, tf in term_counts.items()),
+        )
+        query_norm = self.connection.execute(
+            "SELECT sqrt(COALESCE(SUM(tf * idf * tf * idf), 0)) FROM query_terms"
+        ).fetchone()[0]
+        if query_norm:
+            rows = self.connection.execute(
+                "WITH scores AS ("
+                "SELECT tfidf_terms.entity_id, "
+                "SUM(query_terms.tf * tfidf_terms.tf * term_df.idf * term_df.idf) "
+                "/ (? * records.tfidf_norm) AS cosine "
+                "FROM query_terms JOIN tfidf_terms USING(term) "
+                "JOIN term_df USING(term) JOIN records USING(entity_id) "
+                "WHERE records.tfidf_norm > 0 GROUP BY tfidf_terms.entity_id) "
+                "SELECT records.entity_id, COALESCE(scores.cosine, 0) AS cosine "
+                "FROM records LEFT JOIN scores USING(entity_id) "
+                "ORDER BY cosine DESC, records.ordinal LIMIT ?",
+                (query_norm, top_k),
+            )
+        else:
+            rows = self.connection.execute(
+                "SELECT entity_id, 0 FROM records ORDER BY ordinal LIMIT ?", (top_k,)
+            )
+        return {row[0] for row in rows}
+
+    def candidate_ids(self, row: pd.Series) -> set[str]:
+        name = normalize_name(row["business_name"])
+        address = normalize_address(row["business_address"])
+        candidates = set()
+        candidates.update(self._lookup("exact_name", [name.no_suffix]))
+        candidates.update(self._lookup("name_token", (t for t in name.no_suffix.split() if len(t) >= 2)))
+        candidates.update(self._lookup("name_char_ngram", name.char_ngrams, minimum_shared=2))
+        candidates.update(self._lookup("address_token", (t for t in address.tokens if len(t) >= 3)))
+        candidates.update(self._lookup("address_char", address.char_ngrams, minimum_shared=3))
+        candidates.update(self._tfidf_candidates(row["business_name"], row["business_address"]))
+        return candidates
+
+    def fetch_records(self, entity_ids: Iterable[str]) -> pd.DataFrame:
+        ids = set(entity_ids)
+        if not ids:
+            return pd.DataFrame(columns=["entity_id", "business_name", "business_address", "country"])
+        self.connection.execute("DELETE FROM query_ids")
+        self.connection.executemany(
+            "INSERT INTO query_ids(entity_id) VALUES (?)", ((entity_id,) for entity_id in ids)
+        )
+        return pd.read_sql_query(
+            "SELECT records.entity_id, business_name, business_address, country "
+            "FROM records JOIN query_ids USING(entity_id)",
+            self.connection,
+        )
+
+    def close(self) -> None:
+        self.connection.close()
 
 
 def _index_by_key(df: pd.DataFrame, key_fn: Callable[[pd.Series], Iterable[str]]) -> dict[str, list[str]]:

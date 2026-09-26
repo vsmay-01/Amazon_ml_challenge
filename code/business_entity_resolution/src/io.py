@@ -41,6 +41,25 @@ def _read_tsv(path: str, expected_columns: list[str]) -> pd.DataFrame:
     return df
 
 
+def iter_tsv_batches(path: str, expected_columns: list[str], batch_size: int):
+    """Yield bounded DataFrame batches without retaining earlier batches."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    for df in pd.read_csv(
+        path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+        chunksize=batch_size,
+    ):
+        missing = [c for c in expected_columns if c not in df.columns]
+        if missing:
+            raise ValueError(f"{path}: missing expected columns {missing}. Found {list(df.columns)}")
+        for c in expected_columns:
+            df[c] = df[c].fillna("").astype(str)
+        yield df[expected_columns]
+
+
 def load_sources(data_dir: str, prefix: str, with_ground_truth: bool) -> ChallengeData:
     """
     Load source1/source2/source3 (and optionally ground_truth) from `data_dir`.
@@ -64,22 +83,12 @@ def write_submission(
     matches: pd.DataFrame,
     candidate_pairs: pd.DataFrame,
     output_dir: str,
+    append: bool = False,
 ) -> None:
-    """
-    Write the two required submission files.
-
-    `matches` must have columns: source1_id, source2_id, source3_id
-        (source2_id / source3_id empty string when not applicable -- a match
-        row always links a Source 1 id to exactly one Source 2 OR Source 3 id;
-        represent each link as its own row so a query with multiple matches
-        produces multiple rows.)
-    `candidate_pairs` must be a superset of `matches` and represent the actual
-        final candidate set scored by the matcher (not a discarded earlier
-        blocking stage).
-    """
+    """Write challenge-format rows, aggregating pair tables into comma lists."""
     os.makedirs(output_dir, exist_ok=True)
 
-    match_cols = ["source1_id", "matched_source", "matched_id", "score"]
+    match_cols = ["source1_id", "matched_source", "matched_id"]
     for c in match_cols:
         if c not in matches.columns:
             raise ValueError(f"matches is missing required column: {c}")
@@ -89,9 +98,47 @@ def write_submission(
         if c not in candidate_pairs.columns:
             raise ValueError(f"candidate_pairs is missing required column: {c}")
 
-    matches.to_csv(
-        os.path.join(output_dir, "matching_results.tsv"), sep="\t", index=False
+    match_ids: dict[str, list[str]] = {}
+    for row in matches.itertuples(index=False):
+        source1_id = str(row.source1_id)
+        matched_id = str(row.matched_id)
+        if not matched_id:
+            continue
+        if matched_id not in match_ids.setdefault(source1_id, []):
+            match_ids[source1_id].append(matched_id)
+
+    candidate_ids: dict[str, list[str]] = {}
+    for row in candidate_pairs.itertuples(index=False):
+        source1_id = str(row.source1_id)
+        candidate_id = str(row.candidate_id)
+        if not candidate_id:
+            continue
+        if candidate_id not in candidate_ids.setdefault(source1_id, []):
+            candidate_ids[source1_id].append(candidate_id)
+
+    source1_ids = list(dict.fromkeys(
+        [str(source1_id) for source1_id in matches["source1_id"]]
+        + [str(source1_id) for source1_id in candidate_pairs["source1_id"]]
+    ))
+    match_output = pd.DataFrame(
+        {
+            "source1_entity_id": source1_ids,
+            "matched_entity_ids": [",".join(match_ids.get(source1_id, [])) for source1_id in source1_ids],
+        }
     )
-    candidate_pairs.to_csv(
-        os.path.join(output_dir, "candidate_pairs.tsv"), sep="\t", index=False
+    candidate_output = pd.DataFrame(
+        {
+            "source1_entity_id": source1_ids,
+            "candidate_entity_ids": [",".join(candidate_ids.get(source1_id, [])) for source1_id in source1_ids],
+        }
+    )
+    mode = "a" if append else "w"
+    header = not append
+    match_output.to_csv(
+        os.path.join(output_dir, "matching_results.tsv"),
+        sep="\t", index=False, mode=mode, header=header,
+    )
+    candidate_output.to_csv(
+        os.path.join(output_dir, "candidate_pairs.tsv"),
+        sep="\t", index=False, mode=mode, header=header,
     )
